@@ -109,6 +109,7 @@ JVM_ENTRY_NO_ENV(jboolean, JVM_RaiseSignal(jint sig))
   return JNI_TRUE;
 JVM_END
 
+#if 0
 /*
   All the defined signal names for Haiku.
 
@@ -188,3 +189,4 @@ extern bool signal_name(int signo, char* buf, size_t len) {
   }
   return false;
 }
+#endif

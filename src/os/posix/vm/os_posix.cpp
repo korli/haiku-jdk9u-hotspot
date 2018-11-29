@@ -215,7 +215,7 @@ void os::Posix::print_rlimit_info(outputStream* st) {
   else st->print("%luk", rlim.rlim_cur >> 10);
 
   // Isn't there on solaris
-#if !defined(SOLARIS) && !defined(AIX)
+#if !defined(SOLARIS) && !defined(AIX) && !defined(HAIKU)
   st->print(", NPROC ");
   getrlimit(RLIMIT_NPROC, &rlim);
   if (rlim.rlim_cur == RLIM_INFINITY) st->print("infinity");

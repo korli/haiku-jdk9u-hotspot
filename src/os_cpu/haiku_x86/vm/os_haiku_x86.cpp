@@ -32,7 +32,6 @@
 #include "interpreter/interpreter.hpp"
 #include "jvm_haiku.h"
 #include "memory/allocation.inline.hpp"
-#include "mutex_haiku.inline.hpp"
 #include "os_share_haiku.hpp"
 #include "prims/jniFastGetField.hpp"
 #include "prims/jvm.h"
@@ -86,8 +85,6 @@
 #define SPELL_REG_FP "ebp"
 #endif // AMD64
 
-PRAGMA_FORMAT_MUTE_WARNINGS_FOR_GCC
-
 address os::current_stack_pointer() {
 #ifdef SPARC_WORKS
   register void *esp;
@@ -115,15 +112,15 @@ void os::initialize_thread(Thread* thr) {
 // Nothing to do.
 }
 
-address os::Haiku::ucontext_get_pc(ucontext_t * uc) {
+address os::Haiku::ucontext_get_pc(const ucontext_t * uc) {
   return (address)uc->uc_mcontext.REG_PC;
 }
 
-intptr_t* os::Haiku::ucontext_get_sp(ucontext_t * uc) {
+intptr_t* os::Haiku::ucontext_get_sp(const ucontext_t * uc) {
   return (intptr_t*)uc->uc_mcontext.REG_SP;
 }
 
-intptr_t* os::Haiku::ucontext_get_fp(ucontext_t * uc) {
+intptr_t* os::Haiku::ucontext_get_fp(const ucontext_t * uc) {
   return (intptr_t*)uc->uc_mcontext.REG_FP;
 }
 
@@ -142,11 +139,11 @@ ExtendedPC os::Haiku::fetch_frame_from_ucontext(Thread* thread,
   return os::fetch_frame_from_context(uc, ret_sp, ret_fp);
 }
 
-ExtendedPC os::fetch_frame_from_context(void* ucVoid,
+ExtendedPC os::fetch_frame_from_context(const void* ucVoid,
                     intptr_t** ret_sp, intptr_t** ret_fp) {
 
   ExtendedPC  epc;
-  ucontext_t* uc = (ucontext_t*)ucVoid;
+  const ucontext_t* uc = (const ucontext_t*)ucVoid;
 
   if (uc != NULL) {
     epc = ExtendedPC(os::Haiku::ucontext_get_pc(uc));
@@ -162,11 +159,55 @@ ExtendedPC os::fetch_frame_from_context(void* ucVoid,
   return epc;
 }
 
-frame os::fetch_frame_from_context(void* ucVoid) {
+frame os::fetch_frame_from_context(const void* ucVoid) {
   intptr_t* sp;
   intptr_t* fp;
   ExtendedPC epc = fetch_frame_from_context(ucVoid, &sp, &fp);
   return frame(sp, fp, epc.pc());
+}
+
+frame os::fetch_frame_from_ucontext(Thread* thread, void* ucVoid) {
+  intptr_t* sp;
+  intptr_t* fp;
+  ExtendedPC epc = os::Haiku::fetch_frame_from_ucontext(thread, (ucontext_t*)ucVoid, &sp, &fp);
+  return frame(sp, fp, epc.pc());
+}
+
+bool os::Haiku::get_frame_at_stack_banging_point(JavaThread* thread, ucontext_t* uc, frame* fr) {
+  address pc = (address) os::Haiku::ucontext_get_pc(uc);
+  if (Interpreter::contains(pc)) {
+    // interpreter performs stack banging after the fixed frame header has
+    // been generated while the compilers perform it before. To maintain
+    // semantic consistency between interpreted and compiled frames, the
+    // method returns the Java sender of the current frame.
+    *fr = os::fetch_frame_from_ucontext(thread, uc);
+    if (!fr->is_first_java_frame()) {
+      // get_frame_at_stack_banging_point() is only called when we
+      // have well defined stacks so java_sender() calls do not need
+      // to assert safe_for_sender() first.
+      *fr = fr->java_sender();
+    }
+  } else {
+    // more complex code with compiled code
+    assert(!Interpreter::contains(pc), "Interpreted methods should have been handled above");
+    CodeBlob* cb = CodeCache::find_blob(pc);
+    if (cb == NULL || !cb->is_nmethod() || cb->is_frame_complete_at(pc)) {
+      // Not sure where the pc points to, fallback to default
+      // stack overflow handling
+      return false;
+    } else {
+      *fr = os::fetch_frame_from_ucontext(thread, uc);
+      // in compiled code, the stack banging is performed just after the return pc
+      // has been pushed on the stack
+      *fr = frame(fr->sp() + 1, fr->fp(), (address)*(fr->sp()));
+      if (!fr->is_java_frame()) {
+        // See java_sender() comment above.
+        *fr = fr->java_sender();
+      }
+    }
+  }
+  assert(fr->is_java_frame(), "Safety check");
+  return true;
 }
 
 // By default, gcc always save frame pointer (%ebp/%rbp) on stack. It may get
@@ -216,7 +257,7 @@ JVM_handle_haiku_signal(int sig,
                         int abort_if_unrecognized) {
   ucontext_t* uc = (ucontext_t*) ucVoid;
 
-  Thread* t = ThreadLocalStorage::get_thread_slow();
+  Thread* t = Thread::current_or_null_safe();
 
   // Must do this before SignalHandlerMark, if crash protection installed we will longjmp away
   // (no destructors can be run)
@@ -285,17 +326,34 @@ JVM_handle_haiku_signal(int sig,
       address addr = (address) info->si_addr;
 
       // check if fault address is within thread stack
-      if (addr < thread->stack_base() &&
-          addr >= thread->stack_base() - thread->stack_size()) {
+      if (thread->on_local_stack(addr)) {
         // stack overflow
-        if (thread->in_stack_yellow_zone(addr)) {
-          thread->disable_stack_yellow_zone();
+        if (thread->in_stack_yellow_reserved_zone(addr)) {
           if (thread->thread_state() == _thread_in_Java) {
+            if (thread->in_stack_reserved_zone(addr)) {
+              frame fr;
+              if (os::Haiku::get_frame_at_stack_banging_point(thread, uc, &fr)) {
+                assert(fr.is_java_frame(), "Must be a Java frame");
+                frame activation = SharedRuntime::look_for_reserved_stack_annotated_method(thread, fr);
+                if (activation.sp() != NULL) {
+                  thread->disable_stack_reserved_zone();
+                  if (activation.is_interpreted_frame()) {
+                    thread->set_reserved_stack_activation((address)(
+                      activation.fp() + frame::interpreter_frame_initial_sp_offset));
+                  } else {
+                    thread->set_reserved_stack_activation((address)activation.unextended_sp());
+                  }
+                  return 1;
+                }
+              }
+            }
             // Throw a stack overflow exception.  Guard pages will be reenabled
             // while unwinding the stack.
+            thread->disable_stack_yellow_reserved_zone();
             stub = SharedRuntime::continuation_for_implicit_exception(thread, pc, SharedRuntime::STACK_OVERFLOW);
           } else {
             // Thread was in the vm or native code.  Return and try to finish.
+            thread->disable_stack_yellow_reserved_zone();
             return 1;
           }
         } else if (thread->in_stack_red_zone(addr)) {
@@ -344,9 +402,10 @@ JVM_handle_haiku_signal(int sig,
         // here if the underlying file has been truncated.
         // Do not crash the VM in such a case.
         CodeBlob* cb = CodeCache::find_blob_unsafe(pc);
-        nmethod* nm = (cb != NULL && cb->is_nmethod()) ? (nmethod*)cb : NULL;
+        CompiledMethod* nm = (cb != NULL) ? cb->as_compiled_method_or_null() : NULL;
         if (nm != NULL && nm->has_unsafe_access()) {
-          stub = StubRoutines::handler_for_unsafe_access();
+          address next_pc = Assembler::locate_next_instruction(pc);
+          stub = SharedRuntime::handle_unsafe_access(thread, next_pc);
         }
       }
       else
@@ -395,7 +454,8 @@ JVM_handle_haiku_signal(int sig,
     } else if (thread->thread_state() == _thread_in_vm &&
                sig == SIGBUS && /* info->si_code == BUS_OBJERR && */
                thread->doing_unsafe_access()) {
-        stub = StubRoutines::handler_for_unsafe_access();
+        address next_pc = Assembler::locate_next_instruction(pc);
+        stub = SharedRuntime::handle_unsafe_access(thread, next_pc);
     }
 
     // jni_fast_Get<Primitive>Field can trap at certain pc's if a GC kicks in
@@ -529,10 +589,10 @@ JVM_handle_haiku_signal(int sig,
   sigaddset(&newset, sig);
   sigprocmask(SIG_UNBLOCK, &newset, NULL);
 
-  VMError err(t, sig, pc, info, ucVoid);
-  err.report_and_die();
+  VMError::report_and_die(t, sig, pc, info, ucVoid);
 
   ShouldNotReachHere();
+  return true; // Mute compiler
 }
 
 void os::Haiku::init_thread_fpu_state(void) {
@@ -556,13 +616,21 @@ bool os::is_allocatable(size_t bytes) {
 // thread stack
 
 #ifdef AMD64
-size_t os::Haiku::min_stack_allowed  = 64 * K;
+size_t os::Posix::_compiler_thread_min_stack_allowed = 64 * K;
+size_t os::Posix::_java_thread_min_stack_allowed = 64 * K;
 #else
-size_t os::Haiku::min_stack_allowed  =  (48 DEBUG_ONLY(+4))*K;
+size_t os::Posix::_compiler_thread_min_stack_allowed = (48 DEBUG_ONLY(+4))*K;
+size_t os::Posix::_java_thread_min_stack_allowed = (48 DEBUG_ONLY(+4))*K;
 #endif // AMD64
 
+#ifdef _LP64
+size_t os::Posix::_vm_internal_thread_min_stack_allowed = 64 * K;
+#else
+size_t os::Posix::_vm_internal_thread_min_stack_allowed = (48 DEBUG_ONLY(+ 4)) * K;
+#endif // _LP64
+
 // return default stack size for thr_type
-size_t os::Haiku::default_stack_size(os::ThreadType thr_type) {
+size_t os::Posix::default_stack_size(os::ThreadType thr_type) {
   // default stack size (compiler thread needs larger stack)
 #ifdef AMD64
   size_t s = (thr_type == os::compiler_thread ? 4 * M : 1 * M);
@@ -574,14 +642,15 @@ size_t os::Haiku::default_stack_size(os::ThreadType thr_type) {
 
 size_t os::Haiku::default_guard_size(os::ThreadType thr_type) {
   // Creating guard page is very expensive. Java thread has HotSpot
-  // guard page, only enable glibc guard page for non-Java threads.
-  return (thr_type == java_thread ? 0 : page_size());
+  // guard pages, only enable glibc guard page for non-Java threads.
+  // (Remember: compiler thread is a Java thread, too!)
+  return ((thr_type == java_thread || thr_type == compiler_thread) ? 0 : page_size());
 }
 
 /////////////////////////////////////////////////////////////////////////////
 // helper functions for fatal error handler
 
-void os::print_context(outputStream *st, void *context) {
+void os::print_context(outputStream *st, const void *context) {
   if (context == NULL) return;
 
   ucontext_t *uc = (ucontext_t*)context;
@@ -644,7 +713,7 @@ void os::print_context(outputStream *st, void *context) {
   print_hex_dump(st, pc - 32, pc + 32, sizeof(char));
 }
 
-void os::print_register_info(outputStream *st, void *context) {
+void os::print_register_info(outputStream *st, const void *context) {
   if (context == NULL) return;
 
   ucontext_t *uc = (ucontext_t*)context;
@@ -704,3 +773,8 @@ void os::verify_stack_alignment() {
 #endif
 }
 #endif
+
+int os::extra_bang_size_in_bytes() {
+  // JDK-8050147 requires the full cache line bang for x86.
+  return VM_Version::L1_line_size();
+}

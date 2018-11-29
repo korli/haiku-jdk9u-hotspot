@@ -67,9 +67,9 @@ class Haiku {
   static int page_size(void)                                        { return _page_size; }
   static void set_page_size(int val)                                { _page_size = val; }
 
-  static address   ucontext_get_pc(ucontext_t* uc);
-  static intptr_t* ucontext_get_sp(ucontext_t* uc);
-  static intptr_t* ucontext_get_fp(ucontext_t* uc);
+  static address   ucontext_get_pc(const ucontext_t* uc);
+  static intptr_t* ucontext_get_sp(const ucontext_t* uc);
+  static intptr_t* ucontext_get_fp(const ucontext_t* uc);
 
   // For Analyzer Forte AsyncGetCallTrace profiling support:
   //
@@ -78,6 +78,8 @@ class Haiku {
   // Linux class.
   static ExtendedPC fetch_frame_from_ucontext(Thread* thread, ucontext_t* uc,
     intptr_t** ret_sp, intptr_t** ret_fp);
+
+  static bool get_frame_at_stack_banging_point(JavaThread* thread, ucontext_t* uc, frame* fr);
 
   // This boolean allows users to forward their own non-matching signals
   // to JVM_handle_haiku_signal, harmlessly.
@@ -98,12 +100,7 @@ class Haiku {
   static struct sigaction *get_chained_signal_action(int sig);
   static bool chained_handler(int sig, siginfo_t* siginfo, void* context);
 
-  // Minimum stack size a thread can be created with (allowing
-  // the VM to completely create the thread and enter user code)
-  static size_t min_stack_allowed;
-
-  // Return default stack size or guard size for the specified thread type
-  static size_t default_stack_size(os::ThreadType thr_type);
+  // Return default guard size for the specified thread type
   static size_t default_guard_size(os::ThreadType thr_type);
 
   // Stack overflow handling

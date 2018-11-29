@@ -34,13 +34,13 @@
 #include "jvm_haiku.h"
 #include "memory/allocation.inline.hpp"
 #include "memory/filemap.hpp"
-#include "mutex_haiku.inline.hpp"
 #include "oops/oop.inline.hpp"
 #include "os_share_haiku.hpp"
 #include "prims/jniFastGetField.hpp"
 #include "prims/jvm.h"
 #include "prims/jvm_misc.hpp"
 #include "runtime/arguments.hpp"
+#include "runtime/atomic.hpp"
 #include "runtime/extendedPC.hpp"
 #include "runtime/globals.hpp"
 #include "runtime/interfaceSupport.hpp"
@@ -151,20 +151,6 @@ julong os::physical_memory() {
   return Haiku::physical_memory();
 }
 
-////////////////////////////////////////////////////////////////////////////////
-// environment support
-
-bool os::getenv(const char* name, char* buf, int len) {
-  const char* val = ::getenv(name);
-  if (val != NULL && strlen(val) < (size_t)len) {
-    strcpy(buf, val);
-    return true;
-  }
-  if (len > 0) buf[0] = 0;  // return a null string
-  return false;
-}
-
-
 // Return true if user is running as root.
 bool os::have_special_privileges() {
   return true;
@@ -241,15 +227,13 @@ void os::init_system_properties_values() {
 // Base path of extensions installed on the system.
 #define SYS_EXT_DIR     "/usr/java/packages"
 #define EXTENSIONS_DIR  "/lib/ext"
-#define ENDORSED_DIR    "/lib/endorsed"
 
   // Buffer that fits several sprintfs.
   // Note that the space for the colon and the trailing null are provided
   // by the nulls included by the sizeof operator.
   const size_t bufsize =
-    MAX3((size_t)MAXPATHLEN,  // For dll_dir & friends.
-         (size_t)MAXPATHLEN + sizeof(EXTENSIONS_DIR) + sizeof(SYS_EXT_DIR) + sizeof(EXTENSIONS_DIR), // extensions dir
-         (size_t)MAXPATHLEN + sizeof(ENDORSED_DIR)); // endorsed dir
+    MAX2((size_t)MAXPATHLEN,  // For dll_dir & friends.
+         (size_t)MAXPATHLEN + sizeof(EXTENSIONS_DIR) + sizeof(SYS_EXT_DIR) + sizeof(EXTENSIONS_DIR)); // extensions dir
   char *buf = (char *)NEW_C_HEAP_ARRAY(char, bufsize, mtInternal);
 
   // sysclasspath, java_home, dll_dir
@@ -259,7 +243,10 @@ void os::init_system_properties_values() {
 
     // Found the full path to libjvm.so.
     // Now cut the path to <java_home>/jre if we can.
-    *(strrchr(buf, '/')) = '\0'; // Get rid of /libjvm.so.
+    pslash = strrchr(buf, '/');
+    if (pslash != NULL) {
+      *pslash = '\0';            // Get rid of /libjvm.so.
+    }
     pslash = strrchr(buf, '/');
     if (pslash != NULL) {
       *pslash = '\0';            // Get rid of /{client|server|hotspot}.
@@ -269,11 +256,7 @@ void os::init_system_properties_values() {
     if (pslash != NULL) {
       pslash = strrchr(buf, '/');
       if (pslash != NULL) {
-        *pslash = '\0';          // Get rid of /<arch>.
-        pslash = strrchr(buf, '/');
-        if (pslash != NULL) {
-          *pslash = '\0';        // Get rid of /lib.
-        }
+        *pslash = '\0';        // Get rid of /lib.
       }
     }
     Arguments::set_java_home(buf);
@@ -300,27 +283,22 @@ void os::init_system_properties_values() {
     // That's +1 for the colon and +1 for the trailing '\0'.
     char *ld_library_path = (char *)NEW_C_HEAP_ARRAY(char,
                                                      strlen(v) + 1 +
-                                                     sizeof(SYS_EXT_DIR) + sizeof("/lib/") + strlen(cpu_arch) + sizeof(DEFAULT_LIBPATH) + 1,
+                                                     sizeof(SYS_EXT_DIR) + sizeof("/lib/") + sizeof(DEFAULT_LIBPATH) + 1,
                                                      mtInternal);
-    sprintf(ld_library_path, "%s%s" SYS_EXT_DIR "/lib/%s:" DEFAULT_LIBPATH, v, v_colon, cpu_arch);
+    sprintf(ld_library_path, "%s%s" SYS_EXT_DIR "/lib:" DEFAULT_LIBPATH, v, v_colon);
     Arguments::set_library_path(ld_library_path);
-    FREE_C_HEAP_ARRAY(char, ld_library_path, mtInternal);
+    FREE_C_HEAP_ARRAY(char, ld_library_path);
   }
 
   // Extensions directories.
   sprintf(buf, "%s" EXTENSIONS_DIR ":" SYS_EXT_DIR EXTENSIONS_DIR, Arguments::get_java_home());
   Arguments::set_ext_dirs(buf);
 
-  // Endorsed standards default directory.
-  sprintf(buf, "%s" ENDORSED_DIR, Arguments::get_java_home());
-  Arguments::set_endorsed_dirs(buf);
-
-  FREE_C_HEAP_ARRAY(char, buf, mtInternal);
+  FREE_C_HEAP_ARRAY(char, buf);
 
 #undef DEFAULT_LIBPATH
 #undef SYS_EXT_DIR
 #undef EXTENSIONS_DIR
-#undef ENDORSED_DIR
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -447,7 +425,7 @@ void os::Haiku::hotspot_sigmask(Thread* thread) {
 // create new thread
 
 // Thread start routine for all newly created threads
-static void *java_start(Thread *thread) {
+static void *thread_native_entry(Thread *thread) {
   // Try to randomize the cache line index of hot stack frames.
   // This helps when threads of the same stack traces evict each other's
   // cache lines. The threads can be either from the same JVM instance, or
@@ -457,7 +435,7 @@ static void *java_start(Thread *thread) {
   int pid = os::current_process_id();
   alloca(((pid ^ counter++) & 7) * 128);
 
-  ThreadLocalStorage::set_thread(thread);
+  thread->initialize_thread_current();
 
   OSThread* osthread = thread->osthread();
   Monitor* sync = osthread->startThread_lock();
@@ -488,10 +466,21 @@ static void *java_start(Thread *thread) {
   // call one more level start routine
   thread->run();
 
-  return 0;
+  log_info(os, thread)("Thread finished (tid: " UINTX_FORMAT ", kernel thread id: " UINTX_FORMAT ").",
+    os::current_thread_id(), find_thread(NULL));
+
+  // If a thread has not deleted itself ("delete this") as part of its
+  // termination sequence, we have to ensure thread-local-storage is
+  // cleared before we actually terminate. No threads should ever be
+  // deleted asynchronously with respect to their termination.
+  if (Thread::current_or_null_safe() != NULL) {
+    assert(Thread::current_or_null_safe() == thread, "current thread is wrong");
+    thread->clear_thread_current();
+  }
 }
 
-bool os::create_thread(Thread* thread, ThreadType thr_type, size_t stack_size) {
+bool os::create_thread(Thread* thread, ThreadType thr_type,
+                       size_t req_stack_size) {
   assert(thread->osthread() == NULL, "caller responsible");
 
   // Allocate the OSThread object
@@ -513,33 +502,8 @@ bool os::create_thread(Thread* thread, ThreadType thr_type, size_t stack_size) {
   pthread_attr_init(&attr);
   pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
 
-  // stack size
-  if (stack_size == 0) {
-    stack_size = os::Haiku::default_stack_size(thr_type);
-
-    switch (thr_type) {
-    case os::java_thread:
-      // Java threads use ThreadStackSize which default value can be
-      // changed with the flag -Xss
-      assert (JavaThread::stack_size_at_create() > 0, "this should be set");
-      stack_size = JavaThread::stack_size_at_create();
-      break;
-    case os::compiler_thread:
-      if (CompilerThreadStackSize > 0) {
-        stack_size = (size_t)(CompilerThreadStackSize * K);
-        break;
-      } // else fall through:
-        // use VMThreadStackSize if CompilerThreadStackSize is not defined
-    case os::vm_thread:
-    case os::pgc_thread:
-    case os::cgc_thread:
-    case os::watcher_thread:
-      if (VMThreadStackSize > 0) stack_size = (size_t)(VMThreadStackSize * K);
-      break;
-    }
-  }
-
-  stack_size = MAX2(stack_size, os::Haiku::min_stack_allowed);
+  // calculate stack size if it's not specified by caller
+  size_t stack_size = os::Posix::get_initial_stack_size(thr_type, req_stack_size);
   pthread_attr_setstacksize(&attr, stack_size);
 
   pthread_attr_setguardsize(&attr, os::Haiku::default_guard_size(thr_type));
@@ -547,21 +511,27 @@ bool os::create_thread(Thread* thread, ThreadType thr_type, size_t stack_size) {
   ThreadState state;
 
   pthread_t tid;
-  int ret = pthread_create(&tid, &attr, (void* (*)(void*)) java_start, thread);
+  int ret = pthread_create(&tid, &attr, (void* (*)(void*)) thread_native_entry, thread);
+
+  char buf[64];
+  if (ret == 0) {
+    log_info(os, thread)("Thread started (pthread id: " UINTX_FORMAT ", attributes: %s). ",
+      (uintx) tid, os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
+  } else {
+    log_warning(os, thread)("Failed to start thread - pthread_create failed (%s) for attributes: %s.",
+      os::errno_name(ret), os::Posix::describe_pthread_attr(buf, sizeof(buf), &attr));
+  }
 
   pthread_attr_destroy(&attr);
 
   if (ret != 0) {
-    if (PrintMiscellaneous && (Verbose || WizardMode)) {
-      perror("pthread_create()");
-    }
     // Need to clean up stuff we've allocated so far
     thread->set_osthread(NULL);
     delete osthread;
     return false;
   }
 
-  // Store pthread info into the OSThread
+  // OSThread::thread_id is the pthread id.
   osthread->set_pthread_id(tid);
 
   // Wait until child thread is either initialized or aborted
@@ -647,43 +617,6 @@ void os::free_thread(OSThread* osthread) {
   delete osthread;
 }
 
-//////////////////////////////////////////////////////////////////////////////
-// thread local storage
-
-// Restore the thread pointer if the destructor is called. This is in case
-// someone from JNI code sets up a destructor with pthread_key_create to run
-// detachCurrentThread on thread death. Unless we restore the thread pointer we
-// will hang or crash. When detachCurrentThread is called the key will be set
-// to null and we will not be called again. If detachCurrentThread is never
-// called we could loop forever depending on the pthread implementation.
-static void restore_thread_pointer(void* p) {
-  Thread* thread = (Thread*) p;
-  os::thread_local_storage_at_put(ThreadLocalStorage::thread_index(), thread);
-}
-
-int os::allocate_thread_local_storage() {
-  pthread_key_t key;
-  int rslt = pthread_key_create(&key, restore_thread_pointer);
-  assert(rslt == 0, "cannot allocate thread local storage");
-  return (int)key;
-}
-
-// Note: This is currently not used by VM, as we don't destroy TLS key
-// on VM exit.
-void os::free_thread_local_storage(int index) {
-  int rslt = pthread_key_delete((pthread_key_t)index);
-  assert(rslt == 0, "invalid index");
-}
-
-void os::thread_local_storage_at_put(int index, void* value) {
-  int rslt = pthread_setspecific((pthread_key_t)index, value);
-  assert(rslt == 0, "pthread_setspecific failed");
-}
-
-extern "C" Thread* get_thread() {
-  return ThreadLocalStorage::thread();
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // time support
 
@@ -717,6 +650,14 @@ jlong os::javaTimeMillis() {
   int status = gettimeofday(&time, NULL);
   assert(status != -1, "haiku error");
   return jlong(time.tv_sec) * 1000  +  jlong(time.tv_usec / 1000);
+}
+
+void os::javaTimeSystemUTC(jlong &seconds, jlong &nanos) {
+  timeval time;
+  int status = gettimeofday(&time, NULL);
+  assert(status != -1, "bsd error");
+  seconds = jlong(time.tv_sec);
+  nanos = jlong(time.tv_usec) * 1000;
 }
 
 jlong os::javaTimeNanos() {
@@ -797,7 +738,7 @@ void os::shutdown() {
 // Note: os::abort() might be called very early during initialization, or
 // called from signal handler. Before adding something to os::abort(), make
 // sure it is async-safe and can handle partially initialized VM.
-void os::abort(bool dump_core) {
+void os::abort(bool dump_core, void* siginfo, const void* context) {
   os::shutdown();
   if (dump_core) {
 #ifndef PRODUCT
@@ -892,11 +833,11 @@ bool os::dll_build_name(char* buffer, size_t buflen,
     // release the storage
     for (int i = 0 ; i < n ; i++) {
       if (pelements[i] != NULL) {
-        FREE_C_HEAP_ARRAY(char, pelements[i], mtInternal);
+        FREE_C_HEAP_ARRAY(char, pelements[i]);
       }
     }
     if (pelements != NULL) {
-      FREE_C_HEAP_ARRAY(char*, pelements, mtInternal);
+      FREE_C_HEAP_ARRAY(char*, pelements);
     }
   } else {
     snprintf(buffer, buflen, "%s/lib%s.so", pname, fname);
@@ -925,7 +866,8 @@ bool os::address_is_in_vm(address addr) {
 }
 
 bool os::dll_address_to_function_name(address addr, char *buf,
-                                      int buflen, int *offset) {
+                                      int buflen, int *offset,
+                                      bool demangle) {
   // buf is not optional, but offset is optional
   assert(buf != NULL, "sanity check");
 
@@ -934,7 +876,7 @@ bool os::dll_address_to_function_name(address addr, char *buf,
   if (dladdr((void*)addr, &dlinfo) != 0) {
     // see if we have a matching symbol
     if (dlinfo.dli_saddr != NULL && dlinfo.dli_sname != NULL) {
-      if (!Decoder::demangle(dlinfo.dli_sname, buf, buflen)) {
+      if (!(demangle && Decoder::demangle(dlinfo.dli_sname, buf, buflen))) {
         jio_snprintf(buf, buflen, "%s", dlinfo.dli_sname);
       }
       if (offset != NULL) *offset = addr - (address)dlinfo.dli_saddr;
@@ -943,7 +885,7 @@ bool os::dll_address_to_function_name(address addr, char *buf,
     // no matching symbol so try for just file info
     if (dlinfo.dli_fname != NULL && dlinfo.dli_fbase != NULL) {
       if (Decoder::decode((address)(addr - (address)dlinfo.dli_fbase),
-                          buf, buflen, offset, dlinfo.dli_fname)) {
+                          buf, buflen, offset, dlinfo.dli_fname, demangle)) {
         return true;
       }
     }
@@ -1156,6 +1098,17 @@ void os::print_dll_info(outputStream *st) {
   }
 }
 
+void os::get_summary_os_info(char* buf, size_t buflen) {
+  // These buffers are small because we want this to be brief
+  // and not use a lot of stack while generating the hs_err file.
+  char os[100];
+  strncpy(os, "Haiku", sizeof(os));
+
+  char release[100];
+  strncpy(release, "", sizeof(release));
+  snprintf(buf, buflen, "%s %s", os, release);
+}
+
 void os::print_os_info_brief(outputStream* st) {
   os::Posix::print_uname_info(st);
 
@@ -1174,7 +1127,10 @@ void os::print_os_info(outputStream* st) {
   os::print_memory_info(st);
 }
 
-void os::pd_print_cpu_info(outputStream* st) {
+void os::pd_print_cpu_info(outputStream* st, char* buf, size_t buflen) {
+}
+
+void os::get_summary_cpu_info(char* buf, size_t buflen) {
 }
 
 void os::print_memory_info(outputStream* st) {
@@ -1187,25 +1143,6 @@ void os::print_memory_info(outputStream* st) {
             os::available_memory() >> 10);
   st->cr();
 }
-
-void os::print_siginfo(outputStream* st, void* siginfo) {
-  const siginfo_t* si = (const siginfo_t*)siginfo;
-
-  os::Posix::print_siginfo_brief(st, si);
-#if INCLUDE_CDS
-  if (si && (si->si_signo == SIGBUS || si->si_signo == SIGSEGV) &&
-      UseSharedSpaces) {
-    FileMapInfo* mapinfo = FileMapInfo::current_info();
-    if (mapinfo->is_in_shared_space(si->si_addr)) {
-      st->print("\n\nError accessing class data sharing archive."
-                " Mapped file inaccessible during execution, "
-                " possible disk/network problem.");
-    }
-  }
-#endif
-  st->cr();
-}
-
 
 static void print_signal_handler(outputStream* st, int sig,
                                  char* buf, size_t buflen);
@@ -1257,9 +1194,9 @@ void os::jvm_path(char *buf, jint buflen) {
   if (rp == NULL)
     return;
 
-  if (Arguments::created_by_gamma_launcher()) {
+  if (Arguments::sun_java_launcher_is_altjvm()) {
     // Support for the gamma launcher.  Typical value for buf is
-    // "<JAVA_HOME>/jre/lib/<arch>/<vmtype>/libjvm.so".  If "/jre/lib/" appears at
+    // "<JAVA_HOME>/jre/lib/<vmtype>/libjvm.so".  If "/jre/lib/" appears at
     // the right place in the string, then assume we are installed in a JDK and
     // we're done.  Otherwise, check for a JAVA_HOME environment variable and fix
     // up the path so it looks like libjvm.so is installed there (append a
@@ -1290,9 +1227,9 @@ void os::jvm_path(char *buf, jint buflen) {
         len = strlen(buf);
         assert(len < buflen, "Ran out of buffer room");
         jrelib_p = buf + len;
-        snprintf(jrelib_p, buflen-len, "/jre/lib/%s", cpu_arch);
+        snprintf(jrelib_p, buflen-len, "/jre/lib");
         if (0 != access(buf, F_OK)) {
-          snprintf(jrelib_p, buflen-len, "/lib/%s", cpu_arch);
+          snprintf(jrelib_p, buflen-len, "/lib");
         }
 
         if (0 == access(buf, F_OK)) {
@@ -1715,79 +1652,6 @@ size_t os::read(int fd, void *buf, unsigned int nBytes) {
   return ::read(fd, buf, nBytes);
 }
 
-// TODO-FIXME: reconcile Solaris' os::sleep with the linux variation.
-// Solaris uses poll(), linux uses park().
-// Poll() is likely a better choice, assuming that Thread.interrupt()
-// generates a SIGUSRx signal. Note that SIGUSR1 can interfere with
-// SIGSEGV, see 4355769.
-
-int os::sleep(Thread* thread, jlong millis, bool interruptible) {
-  assert(thread == Thread::current(),  "thread consistency check");
-
-  ParkEvent * const slp = thread->_SleepEvent ;
-  slp->reset() ;
-  OrderAccess::fence() ;
-
-  if (interruptible) {
-    jlong prevtime = javaTimeNanos();
-
-    for (;;) {
-      if (os::is_interrupted(thread, true)) {
-        return OS_INTRPT;
-      }
-
-      jlong newtime = javaTimeNanos();
-
-      // time moving backwards, should only happen if no monotonic clock
-      // not a guarantee() because JVM should not abort on kernel/glibc bugs
-      assert(newtime >= prevtime, "time moving backwards");
-      millis -= (newtime - prevtime) / NANOSECS_PER_MILLISEC;
-
-      if(millis <= 0) {
-        return OS_OK;
-      }
-
-      prevtime = newtime;
-
-      {
-        assert(thread->is_Java_thread(), "sanity check");
-        JavaThread *jt = (JavaThread *) thread;
-        ThreadBlockInVM tbivm(jt);
-        OSThreadWaitState osts(jt->osthread(), false /* not Object.wait() */);
-
-        jt->set_suspend_equivalent();
-        // cleared by handle_special_suspend_equivalent_condition() or
-        // java_suspend_self() via check_and_wait_while_suspended()
-
-        slp->park(millis);
-
-        // were we externally suspended while we were waiting?
-        jt->check_and_wait_while_suspended();
-      }
-    }
-  } else {
-    OSThreadWaitState osts(thread->osthread(), false /* not Object.wait() */);
-    jlong prevtime = javaTimeNanos();
-
-    for (;;) {
-      // It'd be nice to avoid the back-to-back javaTimeNanos() calls on
-      // the 1st iteration ...
-      jlong newtime = javaTimeNanos();
-
-      // time moving backwards, should only happen if no monotonic clock
-      // not a guarantee() because JVM should not abort on kernel/glibc bugs
-      assert(newtime >= prevtime, "time moving backwards");
-      millis -= (newtime - prevtime) / NANOSECS_PER_MILLISEC;
-
-      if(millis <= 0) break ;
-
-      prevtime = newtime;
-      slp->park(millis);
-    }
-    return OS_OK ;
-  }
-}
-
 void os::naked_short_sleep(jlong ms) {
   struct timespec req;
 
@@ -1817,22 +1681,8 @@ bool os::dont_yield() {
   return DontYieldALot;
 }
 
-void os::yield() {
+void os::naked_yield() {
   sched_yield();
-}
-
-os::YieldResult os::NakedYield() { sched_yield(); return os::YIELD_UNKNOWN ;}
-
-void os::yield_all(int attempts) {
-  // Yields to all threads, including threads with lower priorities
-  // Threads on Linux are all with same priority. The Solaris style
-  // os::yield_all() with nanosleep(1ms) is not necessary.
-  sched_yield();
-}
-
-// Called from the tight loops to possibly influence time-sharing heuristics
-void os::loop_breaker(int attempts) {
-  os::yield_all(attempts);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -2108,50 +1958,6 @@ static void do_resume(OSThread* osthread) {
   }
 
   guarantee(osthread->sr.is_running(), "Must be running!");
-}
-
-////////////////////////////////////////////////////////////////////////////////
-// interrupt support
-
-void os::interrupt(Thread* thread) {
-  assert(Thread::current() == thread || Threads_lock->owned_by_self(),
-    "possibility of dangling Thread pointer");
-
-  OSThread* osthread = thread->osthread();
-
-  if (!osthread->interrupted()) {
-    osthread->set_interrupted(true);
-    // More than one thread can get here with the same value of osthread,
-    // resulting in multiple notifications.  We do, however, want the store
-    // to interrupted() to be visible to other threads before we execute unpark().
-    OrderAccess::fence();
-    ParkEvent * const slp = thread->_SleepEvent ;
-    if (slp != NULL) slp->unpark() ;
-  }
-
-  // For JSR166. Unpark even if interrupt status already was set
-  if (thread->is_Java_thread())
-    ((JavaThread*)thread)->parker()->unpark();
-
-  ParkEvent * ev = thread->_ParkEvent ;
-  if (ev != NULL) ev->unpark() ;
-
-}
-
-bool os::is_interrupted(Thread* thread, bool clear_interrupted) {
-  assert(Thread::current() == thread || Threads_lock->owned_by_self(),
-    "possibility of dangling Thread pointer");
-
-  OSThread* osthread = thread->osthread();
-
-  bool interrupted = osthread->interrupted();
-
-  if (interrupted && clear_interrupted) {
-    osthread->set_interrupted(false);
-    // consider thread->_SleepEvent->reset() ... optional optimization
-  }
-
-  return interrupted;
 }
 
 ///////////////////////////////////////////////////////////////////////////////////
@@ -2620,18 +2426,6 @@ extern void report_error(char* file_name, int line_no, char* title, char* format
 
 extern bool signal_name(int signo, char* buf, size_t len);
 
-const char* os::exception_name(int exception_code, char* buf, size_t size) {
-  if (0 < exception_code && exception_code <= SIGRTMAX) {
-    // signal
-    if (!signal_name(exception_code, buf, size)) {
-      jio_snprintf(buf, size, "SIG%d", exception_code);
-    }
-    return buf;
-  } else {
-    return NULL;
-  }
-}
-
 // this is called _before_ the most of global arguments have been parsed
 void os::init(void) {
   clock_tics_per_sec = sysconf(_SC_CLK_TCK);
@@ -2696,28 +2490,10 @@ jint os::init_2(void)
   Haiku::signal_sets_init();
   Haiku::install_signal_handlers();
 
-  // Check minimum allowable stack size for thread creation and to initialize
-  // the java system classes, including StackOverflowError - depends on page
-  // size.  Add a page for compiler2 recursion in main thread.
-  // Add in 2*BytesPerWord times page size to account for VM stack during
-  // class initialization depending on 32 or 64 bit VM.
-  os::Haiku::min_stack_allowed = MAX2(os::Haiku::min_stack_allowed,
-            (size_t)(StackYellowPages+StackRedPages+StackShadowPages+
-                    2*BytesPerWord COMPILER2_PRESENT(+1)) * Haiku::page_size());
-
-  size_t threadStackSizeInBytes = ThreadStackSize * K;
-  if (threadStackSizeInBytes != 0 &&
-      threadStackSizeInBytes < os::Haiku::min_stack_allowed) {
-        tty->print_cr("\nThe stack size specified is too small, "
-                      "Specify at least %dk",
-                      os::Haiku::min_stack_allowed/ K);
-        return JNI_ERR;
+  // Check and sets minimum stack sizes against command line options
+  if (Posix::set_minimum_stack_sizes() == JNI_ERR) {
+    return JNI_ERR;
   }
-
-  // Make the stack size a multiple of the page size so that
-  // the yellow/red zones can be guarded.
-  JavaThread::set_stack_size_at_create(round_to(threadStackSizeInBytes,
-        vm_page_size()));
 
   if (MaxFDLimit) {
     // set the number of file descriptors to max. print out error
@@ -2889,16 +2665,12 @@ bool os::find(address addr, outputStream* st) {
 // able to use structured exception handling (thread-local exception filters)
 // on, e.g., Win32.
 void
-os::os_exception_wrapper(java_call_t f, JavaValue* value, methodHandle* method,
+os::os_exception_wrapper(java_call_t f, JavaValue* value, const methodHandle& method,
                          JavaCallArguments* args, Thread* thread) {
   f(value, method, args, thread);
 }
 
 void os::print_statistics() {
-}
-
-bool os::is_primordial_thread(void) {
-  return find_thread(NULL) == getpid();
 }
 
 address os::current_stack_base() {
@@ -2913,7 +2685,24 @@ size_t os::current_stack_size() {
   return (intptr_t)ti.stack_end - (intptr_t)ti.stack_base;
 }
 
-int os::message_box(const char* title, const char* message) {
+static inline struct timespec get_mtime(const char* filename) {
+  struct stat st;
+  int ret = os::stat(filename, &st);
+  assert(ret == 0, "failed to stat() file '%s': %s", filename, strerror(errno));
+  return st.st_mtim;
+}
+
+int os::compare_file_modified_times(const char* file1, const char* file2) {
+  struct timespec filetime1 = get_mtime(file1);
+  struct timespec filetime2 = get_mtime(file2);
+  int diff = filetime1.tv_sec - filetime2.tv_sec;
+  if (diff == 0) {
+    return filetime1.tv_nsec - filetime2.tv_nsec;
+  }
+  return diff;
+}
+
+bool os::message_box(const char* title, const char* message) {
   int i;
   fdStream err(defaultStream::error_fd());
   for (i = 0; i < 78; i++) err.print_raw("=");
@@ -2940,10 +2729,6 @@ int os::stat(const char *path, struct stat *sbuf) {
   }
   os::native_path(strcpy(pathbuf, path));
   return ::stat(pathbuf, sbuf);
-}
-
-bool os::check_heap(bool force) {
-  return true;
 }
 
 int local_vsnprintf(char* buf, size_t count, const char* format, va_list args) {
@@ -3100,15 +2885,6 @@ int os::available(int fd, jlong *bytes) {
   }
   *bytes = end - cur;
   return 1;
-}
-
-int os::socket_available(int fd, jint *pbytes) {
-  // Linux doc says EINTR not returned, unlike Solaris
-  int ret = ::ioctl(fd, FIONREAD, pbytes);
-
-  //%% note ioctl can return 0 when successful, JVM_SocketAvailable
-  // is expected to return 0 on failure and 1 on success to the jdk.
-  return (ret < 0) ? 0 : 1;
 }
 
 // Map a block of memory.
@@ -3326,50 +3102,62 @@ int os::PlatformEvent::TryPark() {
 }
 
 void os::PlatformEvent::park() {       // AKA "down()"
+  // Transitions for _Event:
+  //   -1 => -1 : illegal
+  //    1 =>  0 : pass - return immediately
+  //    0 => -1 : block; then set _Event to 0 before returning
+
   // Invariant: Only the thread associated with the Event/PlatformEvent
   // may call park().
   // TODO: assert that _Assoc != NULL or _Assoc == Self
-  int v ;
-  for (;;) {
-      v = _Event ;
-      if (Atomic::cmpxchg (v-1, &_Event, v) == v) break ;
-  }
-  guarantee (v >= 0, "invariant") ;
-  if (v == 0) {
-     // Do this the hard way by blocking ...
-     int status = pthread_mutex_lock(_mutex);
-     assert_status(status == 0, status, "mutex_lock");
-     guarantee (_nParked == 0, "invariant") ;
-     ++ _nParked ;
-     while (_Event < 0) {
-        status = pthread_cond_wait(_cond, _mutex);
-        // for some reason, under 2.7 lwp_cond_wait() may return ETIME ...
-        // Treat this the same as if the wait was interrupted
-        if (status == ETIME) { status = EINTR; }
-        assert_status(status == 0 || status == EINTR, status, "cond_wait");
-     }
-     -- _nParked ;
+  assert(_nParked == 0, "invariant");
 
-    _Event = 0 ;
-     status = pthread_mutex_unlock(_mutex);
-     assert_status(status == 0, status, "mutex_unlock");
+  int v;
+  for (;;) {
+    v = _Event;
+    if (Atomic::cmpxchg(v-1, &_Event, v) == v) break;
+  }
+  guarantee(v >= 0, "invariant");
+  if (v == 0) {
+    // Do this the hard way by blocking ...
+    int status = pthread_mutex_lock(_mutex);
+    assert_status(status == 0, status, "mutex_lock");
+    guarantee(_nParked == 0, "invariant");
+    ++_nParked;
+    while (_Event < 0) {
+      status = pthread_cond_wait(_cond, _mutex);
+      // for some reason, under 2.7 lwp_cond_wait() may return ETIME ...
+      // Treat this the same as if the wait was interrupted
+      if (status == ETIME) { status = EINTR; }
+      assert_status(status == 0 || status == EINTR, status, "cond_wait");
+    }
+    --_nParked;
+
+    _Event = 0;
+    status = pthread_mutex_unlock(_mutex);
+    assert_status(status == 0, status, "mutex_unlock");
     // Paranoia to ensure our locked and lock-free paths interact
     // correctly with each other.
     OrderAccess::fence();
   }
-  guarantee (_Event >= 0, "invariant") ;
+  guarantee(_Event >= 0, "invariant");
 }
 
 int os::PlatformEvent::park(jlong millis) {
-  guarantee (_nParked == 0, "invariant") ;
+  // Transitions for _Event:
+  //   -1 => -1 : illegal
+  //    1 =>  0 : pass - return immediately
+  //    0 => -1 : block; then set _Event to 0 before returning
 
-  int v ;
+  guarantee(_nParked == 0, "invariant");
+
+  int v;
   for (;;) {
-      v = _Event ;
-      if (Atomic::cmpxchg (v-1, &_Event, v) == v) break ;
+    v = _Event;
+    if (Atomic::cmpxchg(v-1, &_Event, v) == v) break;
   }
-  guarantee (v >= 0, "invariant") ;
-  if (v != 0) return OS_OK ;
+  guarantee(v >= 0, "invariant");
+  if (v != 0) return OS_OK;
 
   // We do this the hard way, by blocking the thread.
   // Consider enforcing a minimum timeout value.
@@ -3379,8 +3167,8 @@ int os::PlatformEvent::park(jlong millis) {
   int ret = OS_TIMEOUT;
   int status = pthread_mutex_lock(_mutex);
   assert_status(status == 0, status, "mutex_lock");
-  guarantee (_nParked == 0, "invariant") ;
-  ++_nParked ;
+  guarantee(_nParked == 0, "invariant");
+  ++_nParked;
 
   // Object.wait(timo) will return because of
   // (a) notification
@@ -3389,35 +3177,29 @@ int os::PlatformEvent::park(jlong millis) {
   //
   // Thread.interrupt and object.notify{All} both call Event::set.
   // That is, we treat thread.interrupt as a special case of notification.
-  // The underlying Solaris implementation, cond_timedwait, admits
-  // spurious/premature wakeups, but the JLS/JVM spec prevents the
-  // JVM from making those visible to Java code.  As such, we must
-  // filter out spurious wakeups.  We assume all ETIME returns are valid.
+  // We ignore spurious OS wakeups unless FilterSpuriousWakeups is false.
+  // We assume all ETIME returns are valid.
   //
   // TODO: properly differentiate simultaneous notify+interrupt.
   // In that case, we should propagate the notify to another waiter.
 
   while (_Event < 0) {
     status = pthread_cond_timedwait(_cond, _mutex, &abst);
-    /*if (status != 0 && WorkAroundNPTLTimedWaitHang) {
-      pthread_cond_destroy (_cond);
-      pthread_cond_init (_cond, NULL) ;
-    }*/
     assert_status(status == 0 || status == EINTR ||
                   status == ETIME || status == ETIMEDOUT,
                   status, "cond_timedwait");
-    if (!FilterSpuriousWakeups) break ;                 // previous semantics
-    if (status == ETIME || status == ETIMEDOUT) break ;
+    if (!FilterSpuriousWakeups) break;                 // previous semantics
+    if (status == ETIME || status == ETIMEDOUT) break;
     // We consume and ignore EINTR and spurious wakeups.
   }
-  --_nParked ;
+  --_nParked;
   if (_Event >= 0) {
-     ret = OS_OK;
+    ret = OS_OK;
   }
-  _Event = 0 ;
+  _Event = 0;
   status = pthread_mutex_unlock(_mutex);
   assert_status(status == 0, status, "mutex_unlock");
-  assert (_nParked == 0, "invariant") ;
+  assert(_nParked == 0, "invariant");
   // Paranoia to ensure our locked and lock-free paths interact
   // correctly with each other.
   OrderAccess::fence();
@@ -3426,12 +3208,11 @@ int os::PlatformEvent::park(jlong millis) {
 
 void os::PlatformEvent::unpark() {
   // Transitions for _Event:
-  //    0 :=> 1
-  //    1 :=> 1
-  //   -1 :=> either 0 or 1; must signal target thread
-  //          That is, we can safely transition _Event from -1 to either
-  //          0 or 1. Forcing 1 is slightly more efficient for back-to-back
-  //          unpark() calls.
+  //    0 => 1 : just return
+  //    1 => 1 : just return
+  //   -1 => either 0 or 1; must signal target thread
+  //         That is, we can safely transition _Event from -1 to either
+  //         0 or 1.
   // See also: "Semaphores in Plan 9" by Mullender & Cox
   //
   // Note: Forcing a transition from "-1" to "1" on an unpark() means
@@ -3447,22 +3228,19 @@ void os::PlatformEvent::unpark() {
   assert_status(status == 0, status, "mutex_lock");
   int AnyWaiters = _nParked;
   assert(AnyWaiters == 0 || AnyWaiters == 1, "invariant");
-  if (AnyWaiters != 0 && WorkAroundNPTLTimedWaitHang) {
-    AnyWaiters = 0;
-    pthread_cond_signal(_cond);
-  }
   status = pthread_mutex_unlock(_mutex);
   assert_status(status == 0, status, "mutex_unlock");
   if (AnyWaiters != 0) {
+    // Note that we signal() *after* dropping the lock for "immortal" Events.
+    // This is safe and avoids a common class of  futile wakeups.  In rare
+    // circumstances this can cause a thread to return prematurely from
+    // cond_{timed}wait() but the spurious wakeup is benign and the victim
+    // will simply re-test the condition and re-park itself.
+    // This provides particular benefit if the underlying platform does not
+    // provide wait morphing.
     status = pthread_cond_signal(_cond);
     assert_status(status == 0, status, "cond_signal");
   }
-
-  // Note that we signal() _after dropping the lock for "immortal" Events.
-  // This is safe and avoids a common class of  futile wakeups.  In rare
-  // circumstances this can cause a thread to return prematurely from
-  // cond_{timed}wait() but the spurious wakeup is benign and the victim will
-  // simply re-test the condition and re-park itself.
 }
 
 
@@ -3733,4 +3511,30 @@ int os::get_core_path(char* buffer, size_t bufferSize) {
   }
 
   return strlen(buffer);
+}
+
+bool os::start_debugging(char *buf, int buflen) {
+  int len = (int)strlen(buf);
+  char *p = &buf[len];
+
+  jio_snprintf(p, buflen-len,
+               "\n\n"
+               "Do you want to debug the problem?\n\n"
+               "To debug, run 'gdb /proc/%d/exe %d'; then switch to thread " UINTX_FORMAT " (" INTPTR_FORMAT ")\n"
+               "Enter 'yes' to launch gdb automatically (PATH must include gdb)\n"
+               "Otherwise, press RETURN to abort...",
+               os::current_process_id(), os::current_process_id(),
+               os::current_thread_id(), os::current_thread_id());
+
+  bool yes = os::message_box("Unexpected Error", buf);
+
+  if (yes) {
+    // yes, user asked VM to launch debugger
+    jio_snprintf(buf, sizeof(char)*buflen, "gdb /proc/%d/exe %d",
+                 os::current_process_id(), os::current_process_id());
+
+    os::fork_and_exec(buf);
+    yes = false;
+  }
+  return yes;
 }

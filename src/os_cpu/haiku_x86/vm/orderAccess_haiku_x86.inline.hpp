@@ -25,7 +25,7 @@
 #ifndef OS_CPU_HAIKU_X86_VM_ORDERACCESS_HAIKU_X86_INLINE_HPP
 #define OS_CPU_HAIKU_X86_VM_ORDERACCESS_HAIKU_X86_INLINE_HPP
 
-#include "runtime/atomic.inline.hpp"
+#include "runtime/atomic.hpp"
 #include "runtime/orderAccess.hpp"
 #include "runtime/os.hpp"
 #include "vm_version_x86.hpp"

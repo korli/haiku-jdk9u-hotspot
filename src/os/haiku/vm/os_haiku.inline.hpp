@@ -25,8 +25,6 @@
 #ifndef OS_HAIKU_VM_OS_HAIKU_INLINE_HPP
 #define OS_HAIKU_VM_OS_HAIKU_INLINE_HPP
 
-#include "runtime/atomic.inline.hpp"
-#include "runtime/orderAccess.inline.hpp"
 #include "runtime/os.hpp"
 
 // System includes
@@ -35,22 +33,6 @@
 #include <sys/socket.h>
 #include <sys/poll.h>
 #include <netdb.h>
-
-inline void* os::thread_local_storage_at(int index) {
-  return pthread_getspecific((pthread_key_t)index);
-}
-
-inline const char* os::file_separator() {
-  return "/";
-}
-
-inline const char* os::line_separator() {
-  return "\n";
-}
-
-inline const char* os::path_separator() {
-  return ":";
-}
 
 // File names are case-sensitive on windows only
 inline int os::file_name_strcmp(const char* s1, const char* s2) {
@@ -65,7 +47,7 @@ inline bool os::uses_stack_guard_pages() {
   return true;
 }
 
-inline bool os::allocate_stack_guard_pages() {
+inline bool os::must_commit_stack_guard_pages() {
   assert(uses_stack_guard_pages(), "sanity check");
   return true;
 }
@@ -78,7 +60,7 @@ inline void os::pd_split_reserved_memory(char *base, size_t size,
 
 
 // Bang the shadow pages if they need to be touched to be mapped.
-inline void os::bang_stack_shadow_pages() {
+inline void os::map_stack_shadow_pages(address sp) {
 }
 
 inline void os::dll_unload(void *lib) {
@@ -187,88 +169,12 @@ inline int os::raw_send(int fd, char* buf, size_t nBytes, uint flags) {
   return os::send(fd, buf, nBytes, flags);
 }
 
-inline int os::timeout(int fd, long timeout) {
-  julong prevtime,newtime;
-  struct timeval t;
-
-  gettimeofday(&t, NULL);
-  prevtime = ((julong)t.tv_sec * 1000)  +  t.tv_usec / 1000;
-
-  for(;;) {
-    struct pollfd pfd;
-
-    pfd.fd = fd;
-    pfd.events = POLLIN | POLLERR;
-
-    int res = ::poll(&pfd, 1, timeout);
-
-    if (res == OS_ERR && errno == EINTR) {
-
-      // On Linux any value < 0 means "forever"
-
-      if(timeout >= 0) {
-        gettimeofday(&t, NULL);
-        newtime = ((julong)t.tv_sec * 1000)  +  t.tv_usec / 1000;
-        timeout -= newtime - prevtime;
-        if(timeout <= 0)
-          return OS_OK;
-        prevtime = newtime;
-      }
-    } else
-      return res;
-  }
-}
-
-inline int os::listen(int fd, int count) {
-  return ::listen(fd, count);
-}
-
-inline int os::connect(int fd, struct sockaddr *him, socklen_t len) {
-  RESTARTABLE_RETURN_INT(::connect(fd, him, len));
-}
-
-inline int os::accept(int fd, struct sockaddr *him, socklen_t *len) {
-  // Unlike on Linux, this is interruptable on Haiku.
-  RESTARTABLE_RETURN_INT(::accept(fd, him, len));
-}
-
-inline int os::recvfrom(int fd, char* buf, size_t nBytes, uint flags,
-                        sockaddr* from, socklen_t* fromlen) {
-  RESTARTABLE_RETURN_INT((int)::recvfrom(fd, buf, nBytes, flags, from, fromlen));
-}
-
-inline int os::sendto(int fd, char* buf, size_t len, uint flags,
-                      struct sockaddr* to, socklen_t tolen) {
-  RESTARTABLE_RETURN_INT((int)::sendto(fd, buf, len, flags, to, tolen));
-}
-
-inline int os::socket_shutdown(int fd, int howto) {
-  return ::shutdown(fd, howto);
-}
-
-inline int os::bind(int fd, struct sockaddr* him, socklen_t len) {
-  return ::bind(fd, him, len);
-}
-
-inline int os::get_sock_name(int fd, struct sockaddr* him, socklen_t* len) {
-  return ::getsockname(fd, him, len);
-}
-
-inline int os::get_host_name(char* name, int namelen) {
-  return ::gethostname(name, namelen);
-}
-
 inline struct hostent* os::get_host_by_name(char* name) {
   return ::gethostbyname(name);
 }
 
-inline int os::get_sock_opt(int fd, int level, int optname,
-                            char* optval, socklen_t* optlen) {
-  return ::getsockopt(fd, level, optname, optval, optlen);
+inline void os::exit(int num) {
+  ::exit(num);
 }
 
-inline int os::set_sock_opt(int fd, int level, int optname,
-                            const char* optval, socklen_t optlen) {
-  return ::setsockopt(fd, level, optname, optval, optlen);
-}
 #endif // OS_HAIKU_VM_OS_HAIKU_INLINE_HPP
